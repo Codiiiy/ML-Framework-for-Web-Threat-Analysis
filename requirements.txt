@@ -1,0 +1,11 @@
+scikit-learn
+xgboost
+pandas
+numpy
+requests
+beautifulsoup4
+selenium
+lxml
+tldextract
+python-whois
+urllib3
