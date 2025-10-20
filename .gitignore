@@ -1,12 +1,6 @@
-# Ignore everything in the root directory
-*
-
-# EXCEPTions to the ignore rule:
-
-# Un-ignore the directory 'src' and all its contents
-!src/
-
-# Un-ignore the specific file 'README.md'
-!README.md
-
-!requirements.txt
+.venv/
+policies/
+Temp/
+wandb/
+dockerfile
+.gitignore
