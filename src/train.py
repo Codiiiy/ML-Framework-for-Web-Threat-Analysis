@@ -1,32 +1,27 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import math
 import warnings
 import logging
-import argparse
+import pathlib
+import re
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-import requests
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-import wandb
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import joblib
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMP_DIR = os.path.join(os.path.dirname(BASE_DIR), "Temp")
-OUTPUT_DIR = os.path.join(os.path.dirname(BASE_DIR), "policies")
-
-MALICIOUS_CACHE = os.path.join(TEMP_DIR, "malicious_urls.json.gz")
-BENIGN_CACHE = os.path.join(TEMP_DIR, "benign_urls.json.gz")
-CACHE_EXPIRY_HOURS = 24
+try:
+    from google.colab import drive, files
+    COLAB_AVAILABLE = True
+except ImportError:
+    COLAB_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,144 +32,122 @@ logger = logging.getLogger(__name__)
 def configure_logging(is_debug: bool):
     if is_debug:
         root_level = logging.DEBUG
-        urllib3_level = logging.INFO
     else:
-        root_level = logging.INFO
-        urllib3_level = logging.ERROR
-    
-    logger.info(f"Setting root log level to {logging.getLevelName(root_level)} (Debug: {is_debug})")
-    
+        root_level = logging.WARNING
     logging.getLogger().setLevel(root_level)
-    logging.getLogger("urllib3").setLevel(urllib3_level)
 
 @dataclass
 class Config:
     model: str = "XGBoost"
-    n_estimators: int = 200
-    max_depth: int = 7
+    n_estimators: int = 100
+    max_depth: int = 4
     learning_rate: float = 0.05
     n_splits: int = 5
-    num_malicious: int = 5000
-    num_benign: int = 5000
-    max_urls: Optional[int] = None
-    batch_size: int = 500
-    timeout: int = 8
-    max_workers: int = 10
-    retry_attempts: int = 3
     enable_feature_scaling: bool = True
-    use_gpu: bool = False
     debug_mode: bool = False
-    
+    run_local: bool = True
+    base_dir: str = "."
+    dataset_dir: str = "dataset"
+    mount_drive: bool = False
+
     def __post_init__(self):
-        assert self.num_malicious > 0, "num_malicious must be positive"
-        assert self.num_benign > 0, "num_benign must be positive"
-        assert self.max_workers > 0, "max_workers must be positive"
         assert self.n_splits >= 2, "n_splits must be at least 2"
-        if self.max_urls is not None:
-            assert self.max_urls > 0, "max_urls must be positive"
-
-class URLDataCollector:
-    OPENPHISH_FEED = "https://openphish.com/feed.txt"
-    TRANCO_CSV = "https://tranco-list.eu/download/NNZPW/1000000"
-    
-    def __init__(self, timeout: int = 8, retry_attempts: int = 3):
-        self.timeout = timeout
-        self.session = self._create_session(retry_attempts)
         
-    def _create_session(self, retry_attempts: int) -> requests.Session:
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=retry_attempts,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        return session
-    
-    def load_cache(self, path: str) -> Optional[List[str]]:
-        if os.path.exists(path):
-            cache_time = os.path.getmtime(path)
-            if (time.time() - cache_time) < CACHE_EXPIRY_HOURS * 3600:
-                logger.info(f"Loading URLs from up-to-date cache: {path}")
+        if self.run_local:
+            self.project_root = os.path.abspath(self.base_dir)
+        else:
+            if self.mount_drive and COLAB_AVAILABLE:
                 try:
-                    df = pd.read_json(path, compression='gzip', lines=True)
-                    return df[df.columns[0]].tolist() 
+                    drive.mount('/content/drive')
+                    logger.info("Google Drive mounted successfully")
+                    self.project_root = pathlib.Path('/content/drive/MyDrive').resolve()
                 except Exception as e:
-                    logger.warning(f"Error loading cache {path}: {e}")
-                    return None
+                    logger.warning(f"Failed to mount Google Drive: {e}. Using local path instead.")
+                    self.project_root = pathlib.Path('.').resolve()
             else:
-                logger.info(f"Cache expired for {path} after {CACHE_EXPIRY_HOURS} hours. Downloading new feed.")
-        return None
+                self.project_root = pathlib.Path('.').resolve()
+        
+        self.project_root = pathlib.Path(self.project_root)
+        self.project_root.mkdir(parents=True, exist_ok=True)
+        
+        self.dataset_path = self.project_root / self.dataset_dir
+        self.output_dir = str(self.project_root / "policies")
+        
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        logger.debug(f"Working directory: {self.project_root}")
+        logger.debug(f"Dataset directory: {self.dataset_path}")
+        logger.debug(f"Output directory: {self.output_dir}")
 
-    def save_cache(self, path: str, urls: List[str]):
-        os.makedirs(TEMP_DIR, exist_ok=True)
-        df = pd.DataFrame(urls)
-        df.to_json(path, compression='gzip', orient='records', lines=True)
-        logger.info(f"Saved new feed to cache: {path}")
+class DatasetLoader:
+    def __init__(self, config: Config):
+        self.config = config
+        self.benign_dir = config.dataset_path / "benign"
+        self.malicious_dir = config.dataset_path / "malicious"
 
-    def download_openphish(self, n: Optional[int] = None) -> List[str]:
+    def extract_url_from_filename(self, filename: str, label: str) -> str:
+        if label == "benign":
+            url = re.sub(r'^genuine_', '', filename)
+            url = re.sub(r'_\d+$', '', url)
+        else:
+            url = re.sub(r'^phishing_', '', filename)
+            url = re.sub(r'_\d+$', '', url)
+        
+        url = url.replace('.html', '')
+        
+        if not url.startswith('http://') and not url.startswith('https://'):
+            url = 'http://' + url
+        
+        url = unquote(url)
+        
+        return url
+
+    def read_html_content(self, filepath: str) -> str:
         try:
-            logger.info("Downloading OpenPhish feed...")
-            r = self.session.get(self.OPENPHISH_FEED, timeout=20)
-            r.raise_for_status()
-            lines = [l.strip() for l in r.text.splitlines() if l.strip()]
-            urls = lines if n is None else lines[:n]
-            logger.info(f"Downloaded {len(urls)} malicious URLs")
-            return urls
-        except requests.RequestException as e:
-            logger.error(f"Failed to download OpenPhish feed: {e}")
-            raise
-    
-    def download_tranco(self, n: Optional[int] = None) -> List[str]:
-        try:
-            logger.info("Downloading Tranco list...")
-            r = self.session.get(self.TRANCO_CSV, timeout=20)
-            r.raise_for_status()
-            lines = [l.strip().split(",")[-1] for l in r.text.splitlines() if l.strip()]
-            urls = ["https://" + d for d in lines]
-            urls = urls if n is None else urls[:n]
-            logger.info(f"Downloaded {len(urls)} benign URLs")
-            return urls
-        except requests.RequestException as e:
-            logger.error(f"Failed to download Tranco list: {e}")
-            raise
-    
-    def safe_fetch(self, url: str) -> Dict:
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            }
-            r = self.session.get(
-                url, 
-                timeout=self.timeout, 
-                allow_redirects=True, 
-                headers=headers,
-                verify=True
-            )
-            return {
-                "url": url,
-                "final_url": r.url,
-                "status_code": int(r.status_code),
-                "content_len": len(r.content),
-                "text_len": len(r.text) if r.text else 0,
-                "headers": {k.lower(): v for k, v in r.headers.items()},
-                "redirect_count": len(r.history),
-                "error": None
-            }
-        except requests.Timeout:
-            return {"url": url, "error": "timeout"}
-        except requests.TooManyRedirects:
-            return {"url": url, "error": "too_many_redirects"}
-        except requests.exceptions.SSLError:
-            return {"url": url, "error": "ssl_error"}
-        except requests.exceptions.ConnectionError:
-            return {"url": url, "error": "connection_error"}
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
         except Exception as e:
-            return {"url": url, "error": f"unknown: {type(e).__name__}"}
+            logger.warning(f"Error reading {filepath}: {e}")
+            return ""
+
+    def load_data(self) -> Tuple[List[Dict], List[Dict]]:
+        malicious_samples = []
+        benign_samples = []
+
+        if not self.malicious_dir.exists():
+            logger.error(f"Malicious directory not found: {self.malicious_dir}")
+            raise FileNotFoundError(f"Directory not found: {self.malicious_dir}")
+        
+        if not self.benign_dir.exists():
+            logger.error(f"Benign directory not found: {self.benign_dir}")
+            raise FileNotFoundError(f"Directory not found: {self.benign_dir}")
+
+        logger.info(f"Loading malicious samples from {self.malicious_dir}")
+        for filename in os.listdir(self.malicious_dir):
+            filepath = self.malicious_dir / filename
+            if os.path.isfile(filepath):
+                url = self.extract_url_from_filename(filename, "malicious")
+                html_content = self.read_html_content(str(filepath))
+                malicious_samples.append({
+                    "url": url,
+                    "html_content": html_content,
+                    "label": "malicious"
+                })
+
+        logger.info(f"Loading benign samples from {self.benign_dir}")
+        for filename in os.listdir(self.benign_dir):
+            filepath = self.benign_dir / filename
+            if os.path.isfile(filepath):
+                url = self.extract_url_from_filename(filename, "benign")
+                html_content = self.read_html_content(str(filepath))
+                benign_samples.append({
+                    "url": url,
+                    "html_content": html_content,
+                    "label": "benign"
+                })
+
+        logger.info(f"Loaded {len(malicious_samples)} malicious and {len(benign_samples)} benign samples")
+        return malicious_samples, benign_samples
 
 class FeatureExtractor:
     @staticmethod
@@ -186,7 +159,7 @@ class FeatureExtractor:
             cnt[ch] = cnt.get(ch, 0) + 1
         probs = [v / len(s) for v in cnt.values()]
         return -sum(p * math.log2(p) for p in probs if p > 0)
-    
+
     @staticmethod
     def count_special_chars(s: str) -> Dict[str, int]:
         return {
@@ -200,7 +173,7 @@ class FeatureExtractor:
             "num_equals": s.count("="),
             "num_ampersands": s.count("&")
         }
-    
+
     @staticmethod
     def is_ip_address(host: str) -> bool:
         if not host:
@@ -213,7 +186,7 @@ class FeatureExtractor:
             return all(0 <= int(part) <= 255 for part in parts)
         except ValueError:
             return False
-    
+
     @staticmethod
     def extract_lexical(url: str) -> Dict:
         try:
@@ -242,129 +215,101 @@ class FeatureExtractor:
         except Exception as e:
             logger.warning(f"Error extracting lexical features from {url}: {e}")
             return {}
-    
+
+    @staticmethod
+    def extract_html_features(html_content: str) -> Dict:
+        try:
+            html_lower = html_content.lower()
+            return {
+                "html_len": len(html_content),
+                "num_scripts": html_content.count("<script"),
+                "num_iframes": html_content.count("<iframe"),
+                "num_forms": html_content.count("<form"),
+                "num_inputs": html_content.count("<input"),
+                "num_links": html_content.count("<a "),
+                "num_images": html_content.count("<img"),
+                "has_password_field": int("type=\"password\"" in html_lower or "type='password'" in html_lower),
+                "has_hidden_input": int("type=\"hidden\"" in html_lower or "type='hidden'" in html_lower),
+                "num_external_links": html_content.count("http://") + html_content.count("https://"),
+                "num_suspicious_keywords": sum(kw in html_lower for kw in ["verify", "suspend", "confirm", "urgent", "click here", "update", "secure"]),
+                "html_entropy": FeatureExtractor.url_entropy(html_content[:10000])
+            }
+        except Exception as e:
+            logger.warning(f"Error extracting HTML features: {e}")
+            return {}
+
     @staticmethod
     def extract_features(record: Dict) -> Dict:
         url = record.get("url", "")
-        error = record.get("error")
-        features = FeatureExtractor.extract_lexical(url)
-        if error:
-            features.update({
-                "status_code": -1,
-                "content_len": 0,
-                "text_len": 0,
-                "num_headers": 0,
-                "redirect": 0,
-                "redirect_count": 0,
-                "server_present": 0,
-                "html_content_type": 0,
-                "has_error": 1,
-                "error_timeout": int(error == "timeout"),
-                "error_ssl": int(error == "ssl_error"),
-                "error_connection": int(error == "connection_error")
-            })
-        else:
-            headers = record.get("headers", {})
-            content_type = headers.get("content-type", "")
-            features.update({
-                "status_code": record.get("status_code", 0),
-                "content_len": record.get("content_len", 0),
-                "text_len": record.get("text_len", 0),
-                "num_headers": len(headers),
-                "redirect": int(record.get("final_url") != url),
-                "redirect_count": record.get("redirect_count", 0),
-                "server_present": int(bool(headers.get("server"))),
-                "html_content_type": int("text/html" in content_type.lower()),
-                "has_error": 0,
-                "error_timeout": 0,
-                "error_ssl": 0,
-                "error_connection": 0,
-                "has_x_frame_options": int("x-frame-options" in headers),
-                "has_csp": int("content-security-policy" in headers),
-                "has_strict_transport": int("strict-transport-security" in headers)
-            })
+        html_content = record.get("html_content", "")
+        
+        lexical_features = FeatureExtractor.extract_lexical(url)
+        html_features = FeatureExtractor.extract_html_features(html_content)
+        
+        if not lexical_features:
+            return {}
+        
+        features = {**lexical_features, **html_features}
         return features
 
 class PhishingDetector:
     def __init__(self, config: Config):
         self.config = config
-        self.collector = URLDataCollector(
-            timeout=config.timeout,
-            retry_attempts=config.retry_attempts
-        )
+        self.loader = DatasetLoader(config)
         self.scaler = StandardScaler() if config.enable_feature_scaling else None
         self.label_encoder = LabelEncoder()
-        wandb.init(
-            project="poisonweb",
-            name=f"phishing_detector_{int(time.time())}",
-            config=asdict(config)
-        )
         configure_logging(config.debug_mode)
-    
-    def process_urls_parallel(self, urls: List[str], label: str) -> List[Dict]:
-        rows = []
-        total = len(urls)
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            future_to_url = {
-                executor.submit(self.collector.safe_fetch, url): url 
-                for url in urls
-            }
-            for i, future in enumerate(as_completed(future_to_url), 1):
-                try:
-                    record = future.result()
-                    features = FeatureExtractor.extract_features(record)
-                    
-                    if features:
-                        features["url"] = record.get("url", "MISSING_URL") 
-                        features["label"] = label
-                        rows.append(features)
-                    else:
-                        logger.warning(f"Feature extraction failed completely for URL: {record.get('url', 'UNKNOWN')}")
 
-                    if i % 100 == 0:
-                        logger.info(f"Processed {i}/{total} {label} URLs")
-                except Exception as e:
-                    logger.error(f"Error processing URL: {e}")
+    def process_samples(self, samples: List[Dict]) -> List[Dict]:
+        rows = []
+        failed_count = 0
+        
+        for i, sample in enumerate(samples, 1):
+            try:
+                features = FeatureExtractor.extract_features(sample)
+                if features:
+                    features["url"] = sample.get("url", "MISSING_URL")
+                    features["label"] = sample.get("label")
+                    rows.append(features)
+                else:
+                    failed_count += 1
+                    logger.debug(f"Feature extraction failed for sample: {sample.get('url', 'UNKNOWN')}")
+                
+                if i % 500 == 0:
+                    logger.info(f"Processed {i}/{len(samples)} samples ({len(rows)} successful)")
+            except Exception as e:
+                failed_count += 1
+                logger.debug(f"Error processing sample: {e}")
+        
+        logger.info(f"Batch complete: {len(rows)}/{len(samples)} samples successfully processed")
         return rows
-    
+
     def prepare_data(self) -> Tuple[pd.DataFrame, pd.Series]:
-        num_mal = self.config.num_malicious
-        num_ben = self.config.num_benign
-        if self.config.max_urls is not None:
-            max_urls_per_class = self.config.max_urls // 2
-            num_mal = max_urls_per_class
-            num_ben = max_urls_per_class
-            logger.info(f"Using --max-urls={self.config.max_urls}. Setting mal/ben count to {max_urls_per_class} each.")
+        malicious_samples, benign_samples = self.loader.load_data()
         
-        malicious_urls = self.collector.load_cache(MALICIOUS_CACHE)
-        if not malicious_urls:
-            malicious_urls = self.collector.download_openphish(num_mal)
-            self.collector.save_cache(MALICIOUS_CACHE, malicious_urls)
+        logger.info("=" * 60)
+        logger.info("PROCESSING SAMPLES")
+        logger.info("=" * 60)
         
-        benign_urls = self.collector.load_cache(BENIGN_CACHE)
-        if not benign_urls:
-            benign_urls = self.collector.download_tranco(num_ben)
-            self.collector.save_cache(BENIGN_CACHE, benign_urls)
-        
-        malicious_urls = malicious_urls[:num_mal]
-        benign_urls = benign_urls[:num_ben]
-        
-        logger.info("Processing malicious URLs...")
-        mal_samples = self.process_urls_parallel(malicious_urls, "malicious")
-        logger.info("Processing benign URLs...")
-        ben_samples = self.process_urls_parallel(benign_urls, "benign")
-        
-        df = pd.DataFrame(mal_samples + ben_samples)
-        
+        all_samples = malicious_samples + benign_samples
+        processed_rows = self.process_samples(all_samples)
+
+        logger.info("=" * 60)
+        logger.info(f"FINAL COLLECTION: {len(processed_rows)} total samples")
+        logger.info("=" * 60)
+
+        df = pd.DataFrame(processed_rows)
         logger.info(f"Initial dataset size: {len(df)} samples")
-        
+
         df = df.drop_duplicates(subset=["url"])
-        
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.dropna(axis=0)
         df = df.reset_index(drop=True)
         logger.info(f"Cleaned dataset size: {len(df)} samples")
-        logger.info(f"Label distribution:\n{df['label'].value_counts()}")
+        
+        label_counts = df['label'].value_counts()
+        logger.info(f"Label distribution:\n{label_counts}")
+
         X = df.drop("label", axis=1)
         y = df["label"]
         if "url" in X.columns:
@@ -375,12 +320,12 @@ class PhishingDetector:
         X = X.fillna(0)
         X = X.clip(lower=-1e10, upper=1e10)
         y = pd.Series(self.label_encoder.fit_transform(y))
-        label_mapping = dict(zip(self.label_encoder.classes_, 
+
+        label_mapping = dict(zip(self.label_encoder.classes_,
                                  self.label_encoder.transform(self.label_encoder.classes_)))
         logger.info(f"Label mapping: {label_mapping}")
-        wandb.log({"label_mapping": label_mapping})
         return X, y
-    
+
     def train_with_cv(self, X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
         if self.scaler:
             X_scaled = pd.DataFrame(
@@ -390,112 +335,113 @@ class PhishingDetector:
             )
         else:
             X_scaled = X
-            
-        params = {}
-        if self.config.use_gpu:
-            params['device'] = 'cuda'
-            logger.info("Using device='cuda' for GPU acceleration.")
-        else:
-            params['tree_method'] = 'hist'
-            logger.info("Using tree_method='hist' (CPU).")
-        
+
+        class_counts = np.bincount(y)
+        total = len(y)
+        scale_pos_weight = class_counts[0] / class_counts[1] if len(class_counts) > 1 else 1.0
+        logger.info(f"Class imbalance ratio: {scale_pos_weight:.2f} (benign/malicious)")
+
         skf = StratifiedKFold(
             n_splits=self.config.n_splits,
             shuffle=True,
             random_state=42
         )
-        metrics = []
+        accuracies = []
+        precisions = []
+        recalls = []
+        f1_scores = []
         fold = 1
         for train_idx, val_idx in skf.split(X_scaled, y):
             X_train, X_val = X_scaled.iloc[train_idx], X_scaled.iloc[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
+
             model = xgb.XGBClassifier(
-                **params,
+                tree_method='hist',
                 n_jobs=-1,
                 n_estimators=self.config.n_estimators,
                 max_depth=self.config.max_depth,
                 learning_rate=self.config.learning_rate,
                 eval_metric='logloss',
-                random_state=42
+                random_state=42,
+                scale_pos_weight=scale_pos_weight,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=3,
+                gamma=0.1,
+                reg_alpha=0.1,
+                reg_lambda=1.0
             )
             model.fit(X_train, y_train)
 
             y_pred = model.predict(X_val)
-
             acc = accuracy_score(y_val, y_pred)
-            report = classification_report(y_val, y_pred, output_dict=True)
-            cm = confusion_matrix(y_val, y_pred)
-            wandb.log({
-                f"fold_{fold}/accuracy": acc,
-                f"fold_{fold}/precision": report.get('1', {}).get('precision', 0),
-                f"fold_{fold}/recall": report.get('1', {}).get('recall', 0),
-                f"fold_{fold}/f1": report.get('1', {}).get('f1-score', 0),
-                f"fold_{fold}/confusion_matrix": wandb.plot.confusion_matrix(
-                    probs=None,
-                    y_true=y_val.values,
-                    preds=y_pred,
-                    class_names=self.label_encoder.classes_.tolist()
-                )
-            })
-            metrics.append(acc)
-            logger.info(f"Fold {fold} - Accuracy: {acc:.4f}, "
-                        f"Precision: {report.get('1', {}).get('precision', 0):.4f}, "
-                        f"Recall: {report.get('1', {}).get('recall', 0):.4f}")
+            report = classification_report(y_val, y_pred, output_dict=True, zero_division=0)
+            
+            accuracies.append(acc)
+            precisions.append(report.get('1', {}).get('precision', 0))
+            recalls.append(report.get('1', {}).get('recall', 0))
+            f1_scores.append(report.get('1', {}).get('f1-score', 0))
+            
+            logger.info(f"Fold {fold} complete")
             fold += 1
-        wandb.log({
-            "cv_mean_accuracy": float(np.mean(metrics)),
-            "cv_std_accuracy": float(np.std(metrics)),
-            "cv_min_accuracy": float(np.min(metrics)),
-            "cv_max_accuracy": float(np.max(metrics))
-        })
-        logger.info(f"\nCross-validation results:")
-        logger.info(f"Mean Accuracy: {np.mean(metrics):.4f} (+/- {np.std(metrics):.4f})")
-        logger.info("Training final model on full dataset...")
-        
+
+        print("\nCross-Validation Results:")
+        print(f"Accuracy  - Mean: {np.mean(accuracies):.4f} | Min: {np.min(accuracies):.4f} | Max: {np.max(accuracies):.4f}")
+        print(f"Precision - Mean: {np.mean(precisions):.4f} | Min: {np.min(precisions):.4f} | Max: {np.max(precisions):.4f}")
+        print(f"Recall    - Mean: {np.mean(recalls):.4f} | Min: {np.min(recalls):.4f} | Max: {np.max(recalls):.4f}")
+        print(f"F1 Score  - Mean: {np.mean(f1_scores):.4f} | Min: {np.min(f1_scores):.4f} | Max: {np.max(f1_scores):.4f}")
+
         final_model = xgb.XGBClassifier(
-            **params,
+            tree_method='hist',
             n_jobs=-1,
             n_estimators=self.config.n_estimators,
             max_depth=self.config.max_depth,
             learning_rate=self.config.learning_rate,
             eval_metric='logloss',
-            random_state=42
+            random_state=42,
+            scale_pos_weight=scale_pos_weight,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=3,
+            gamma=0.1,
+            reg_alpha=0.1,
+            reg_lambda=1.0
         )
         final_model.fit(X_scaled, y)
-            
+
         feature_importance = pd.DataFrame({
             'feature': X.columns,
             'importance': final_model.feature_importances_
         }).sort_values('importance', ascending=False)
-        logger.info(f"\nTop 10 most important features:")
-        logger.info(feature_importance.head(10).to_string())
-        wandb.log({
-            "feature_importance": wandb.Table(dataframe=feature_importance)
-        })
+        print(f"\nTop 10 features:")
+        print(feature_importance.head(10).to_string(index=False))
+        
+        importance_path = os.path.join(self.config.output_dir, "feature_importance.csv")
+        feature_importance.to_csv(importance_path, index=False)
+        
         return final_model
-    
+
     def save_model(self, model: xgb.XGBClassifier):
-        output_dir = OUTPUT_DIR 
-        os.makedirs(output_dir, exist_ok=True)
-        model_path = os.path.join(output_dir, "xgb_phishing_detector.json")
+        model_path = os.path.join(self.config.output_dir, "xgb_phishing_detector.json")
         model.save_model(model_path)
-        logger.info(f"Model saved to {model_path}")
+
         if self.scaler:
-            scaler_path = os.path.join(output_dir, "feature_scaler.pkl")
+            scaler_path = os.path.join(self.config.output_dir, "feature_scaler.pkl")
             joblib.dump(self.scaler, scaler_path)
-            logger.info(f"Scaler saved to {scaler_path}")
-        le_path = os.path.join(output_dir, "label_encoder.pkl")
+
+        le_path = os.path.join(self.config.output_dir, "label_encoder.pkl")
         joblib.dump(self.label_encoder, le_path)
-        logger.info(f"Label encoder saved to {le_path}")
-        artifact = wandb.Artifact("phishing_detector", type="model")
-        artifact.add_file(model_path)
-        if self.scaler:
-            artifact.add_file(scaler_path)
-        artifact.add_file(le_path)
-        wandb.log_artifact(artifact)
-        logger.info("✅ Training complete and artifacts saved")
-    
+        
+        print("\nTraining complete! Model saved successfully.")
+        
+        if not self.config.run_local and COLAB_AVAILABLE and not self.config.mount_drive:
+            for path in [model_path, scaler_path, le_path]:
+                if os.path.exists(path):
+                    try:
+                        files.download(path)
+                    except Exception as e:
+                        logger.warning(f"Could not download {path}: {e}")
+
     def run(self):
         try:
             X, y = self.prepare_data()
@@ -504,53 +450,20 @@ class PhishingDetector:
         except Exception as e:
             logger.error(f"Pipeline failed: {e}", exc_info=True)
             raise
-        finally:
-            wandb.finish()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Train phishing detection model with XGBoost",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("--num-malicious", type=int, default=5000,
-                        help="Number of malicious URLs to collect")
-    parser.add_argument("--num-benign", type=int, default=5000,
-                        help="Number of benign URLs to collect")
-    parser.add_argument("--max-urls", type=int, default=None,
-                        help="Maximum total number of URLs (malicious + benign) to collect. Overrides --num-malicious and --num-benign if set.")
-    parser.add_argument("--n-estimators", type=int, default=200,
-                        help="Number of boosting rounds")
-    parser.add_argument("--max-depth", type=int, default=7,
-                        help="Maximum tree depth")
-    parser.add_argument("--learning-rate", type=float, default=0.05,
-                        help="Learning rate (eta)")
-    parser.add_argument("--n-splits", type=int, default=5,
-                        help="Number of cross-validation folds")
-    parser.add_argument("--gpu", action="store_true",
-                        help="Use GPU acceleration (gpu_hist) instead of CPU (hist)")
-    parser.add_argument("--max-workers", type=int, default=10,
-                        help="Number of parallel workers for URL fetching")
-    parser.add_argument("--timeout", type=int, default=8,
-                        help="HTTP request timeout in seconds")
-    parser.add_argument("--no-scaling", action="store_true",
-                        help="Disable feature scaling")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable DEBUG logging level for detailed output.")
-    args = parser.parse_args()
     config = Config(
-        n_estimators=args.n_estimators,
-        max_depth=args.max_depth,
-        learning_rate=args.learning_rate,
-        n_splits=args.n_splits,
-        num_malicious=args.num_malicious,
-        num_benign=args.num_benign,
-        max_urls=args.max_urls,
-        max_workers=args.max_workers,
-        timeout=args.timeout,
-        enable_feature_scaling=not args.no_scaling,
-        use_gpu=args.gpu,
-        debug_mode=args.debug
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.01,
+        n_splits=10,
+        enable_feature_scaling=True,
+        debug_mode=False,
+        run_local=True,
+        base_dir=".",
+        dataset_dir="dataset"
     )
-    logger.info(f"Configuration: {asdict(config)}")
+    
     detector = PhishingDetector(config)
+    print("Starting phishing detection pipeline...")
     detector.run()
