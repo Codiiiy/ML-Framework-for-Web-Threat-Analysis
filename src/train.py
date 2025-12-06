@@ -1,8 +1,5 @@
-# -*- coding: utf-8 -*-
 import os
-import time
 import math
-import warnings
 import logging
 import pathlib
 import re
@@ -84,6 +81,33 @@ class DatasetLoader:
         self.config = config
         self.benign_dir = config.dataset_path / "benign"
         self.malicious_dir = config.dataset_path / "malicious"
+        self.skipped_ip_count = 0
+
+    def is_ip_address(self, host: str) -> bool:
+        """Check if a host string is an IP address"""
+        if not host:
+            return False
+        host = host.split(':')[0]
+        parts = host.split('.')
+        if len(parts) == 4:
+            try:
+                return all(0 <= int(part) <= 255 for part in parts)
+            except ValueError:
+                return False
+        return False
+
+    def should_skip_url(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower().split(':')[0]
+            
+            if self.is_ip_address(host):
+                logger.debug(f"Skipping IP-based URL: {url}")
+                return True
+            return False
+        except Exception as e:
+            logger.debug(f"Error parsing URL {url}: {e}")
+            return False
 
     def extract_url_from_filename(self, filename: str, label: str) -> str:
         if label == "benign":
@@ -127,6 +151,11 @@ class DatasetLoader:
             filepath = self.malicious_dir / filename
             if os.path.isfile(filepath):
                 url = self.extract_url_from_filename(filename, "malicious")
+                
+                if self.should_skip_url(url):
+                    self.skipped_ip_count += 1
+                    continue
+                
                 html_content = self.read_html_content(str(filepath))
                 malicious_samples.append({
                     "url": url,
@@ -139,6 +168,12 @@ class DatasetLoader:
             filepath = self.benign_dir / filename
             if os.path.isfile(filepath):
                 url = self.extract_url_from_filename(filename, "benign")
+                
+                # Skip if URL is IP-based
+                if self.should_skip_url(url):
+                    self.skipped_ip_count += 1
+                    continue
+                
                 html_content = self.read_html_content(str(filepath))
                 benign_samples.append({
                     "url": url,
@@ -147,6 +182,7 @@ class DatasetLoader:
                 })
 
         logger.info(f"Loaded {len(malicious_samples)} malicious and {len(benign_samples)} benign samples")
+        logger.info(f"Skipped {self.skipped_ip_count} IP-based URLs")
         return malicious_samples, benign_samples
 
 class FeatureExtractor:
@@ -209,8 +245,14 @@ class FeatureExtractor:
                 "has_pay_kw": int(any(kw in url.lower() for kw in ["pay", "bank", "update", "confirm"])),
                 "has_suspicious_tld": int(any(url.endswith(tld) for tld in [".tk", ".ml", ".ga", ".cf", ".gq"])),
                 "protocol_https": int(p.scheme == "https"),
-                "has_port": int(bool(p.port)),
-                "subdomain_count": host.count(".") - 1 if "." in host else 0
+                "subdomain_count": host.count(".") - 1 if "." in host else 0,
+                "digit_letter_ratio": (sum(c.isdigit() for c in url) / max(1, sum(c.isalpha() for c in url))),
+                "has_punycode": int("xn--" in url),
+                "has_misspelled_brand": int(any(bad in url for bad in ["paypai", "g00gle", "faceb00k", "micros0ft"])),
+                "keyword_pressure": int(any(kw in url.lower() for kw in ["urgent", "alert", "warning", "unlock"])),
+                "rare_tld": int(any(url.endswith(t) for t in [".zip", ".kim", ".country", ".science", ".work"])),
+                "path_depth": urlparse(url).path.count("/"),
+                "num_params": urlparse(url).query.count("&") + 1 if urlparse(url).query else 0
             }
         except Exception as e:
             logger.warning(f"Error extracting lexical features from {url}: {e}")
@@ -232,7 +274,14 @@ class FeatureExtractor:
                 "has_hidden_input": int("type=\"hidden\"" in html_lower or "type='hidden'" in html_lower),
                 "num_external_links": html_content.count("http://") + html_content.count("https://"),
                 "num_suspicious_keywords": sum(kw in html_lower for kw in ["verify", "suspend", "confirm", "urgent", "click here", "update", "secure"]),
-                "html_entropy": FeatureExtractor.url_entropy(html_content[:10000])
+                "html_entropy": FeatureExtractor.url_entropy(html_content[:10000]),
+                "num_obfuscated_js": html_lower.count("eval(") + html_lower.count("atob(") + html_lower.count("unescape("),
+                "has_onclick_hooks": int("onclick=" in html_lower),
+                "has_onmouseover_hooks": int("onmouseover=" in html_lower),
+                "external_script_loads": html_lower.count("src=\"http") + html_lower.count("src='http"),
+                "form_action_external": int("action=\"http" in html_lower or "action='http" in html_lower),
+                "spoofed_brand_terms": sum(t in html_lower for t in ["bank", "apple id", "office365", "paypal", "google account"]),
+                "fake_security_indicators": sum(t in html_lower for t in ["secure login", "security check", "validate account"])
             }
         except Exception as e:
             logger.warning(f"Error extracting HTML features: {e}")
@@ -389,7 +438,7 @@ class PhishingDetector:
         print(f"Accuracy  - Mean: {np.mean(accuracies):.4f} | Min: {np.min(accuracies):.4f} | Max: {np.max(accuracies):.4f}")
         print(f"Precision - Mean: {np.mean(precisions):.4f} | Min: {np.min(precisions):.4f} | Max: {np.max(precisions):.4f}")
         print(f"Recall    - Mean: {np.mean(recalls):.4f} | Min: {np.min(recalls):.4f} | Max: {np.max(recalls):.4f}")
-        print(f"F1 Score  - Mean: {np.mean(f1_scores):.4f} | Min: {np.min(f1_scores):.4f} | Max: {np.max(f1_scores):.4f}")
+        print(f"F1 Score  - Mean: {np.mean(f1_scores):.4f} | Min: {np.min(f1_scores):.4f} | Max: {np.min(f1_scores):.4f}")
 
         final_model = xgb.XGBClassifier(
             tree_method='hist',
@@ -453,12 +502,12 @@ class PhishingDetector:
 
 if __name__ == "__main__":
     config = Config(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.01,
+        n_estimators=100,
+        max_depth=12,
+        learning_rate=0.05,
         n_splits=10,
         enable_feature_scaling=True,
-        debug_mode=False,
+        debug_mode=True,
         run_local=True,
         base_dir=".",
         dataset_dir="dataset"
