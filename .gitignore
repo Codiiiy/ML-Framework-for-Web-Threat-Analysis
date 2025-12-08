@@ -1,6 +1,8 @@
 .venv/
-policies/
-Temp/
-wandb/
-dockerfile
-.gitignore
+dataset/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.DS_Store
