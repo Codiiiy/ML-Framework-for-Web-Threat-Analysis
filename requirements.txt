@@ -1,11 +1,10 @@
-scikit-learn
-xgboost
 pandas
 numpy
+xgboost
+scikit-learn
 requests
-beautifulsoup4
-selenium
-lxml
-tldextract
-python-whois
 urllib3
+joblib
+tqdm
+pyarrow
+tldextract

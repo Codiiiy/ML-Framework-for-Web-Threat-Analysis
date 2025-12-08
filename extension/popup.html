@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phishing Shield</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      width: 400px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #1F2937;
+    }
+    
+    .container {
+      background: white;
+      min-height: 500px;
+    }
+    
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 20px;
+      text-align: center;
+    }
+    
+    .header h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+    
+    .header p {
+      font-size: 13px;
+      opacity: 0.9;
+    }
+    
+    .content {
+      padding: 20px;
+    }
+    
+    .status-card {
+      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    
+    .status-card.safe {
+      background: linear-gradient(135deg, #d4fc79 0%, #96e6a1 100%);
+    }
+    
+    .status-card.danger {
+      background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+    }
+    
+    .status-icon {
+      font-size: 48px;
+      margin-bottom: 10px;
+    }
+    
+    .status-text {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 5px;
+    }
+    
+    .confidence {
+      font-size: 14px;
+      opacity: 0.8;
+    }
+    
+    .info-section {
+      margin-bottom: 20px;
+    }
+    
+    .info-section h3 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 10px;
+      color: #4B5563;
+    }
+    
+    .info-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      border-bottom: 1px solid #E5E7EB;
+      font-size: 13px;
+    }
+    
+    .info-item:last-child {
+      border-bottom: none;
+    }
+    
+    .info-label {
+      color: #6B7280;
+      font-weight: 500;
+    }
+    
+    .info-value {
+      color: #1F2937;
+      font-weight: 600;
+    }
+    
+    .upload-section {
+      background: #F9FAFB;
+      border: 2px dashed #D1D5DB;
+      border-radius: 8px;
+      padding: 20px;
+      text-align: center;
+      margin-bottom: 15px;
+    }
+    
+    .upload-section h3 {
+      font-size: 14px;
+      margin-bottom: 10px;
+      color: #4B5563;
+    }
+    
+    .btn {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s;
+      width: 100%;
+    }
+    
+    .btn:hover {
+      transform: translateY(-2px);
+    }
+    
+    .btn:active {
+      transform: translateY(0);
+    }
+    
+    input[type="file"] {
+      display: none;
+    }
+    
+    .loading {
+      text-align: center;
+      padding: 40px 20px;
+    }
+    
+    .spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #667eea;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 15px;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    .error {
+      background: #FEF2F2;
+      color: #991B1B;
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 15px;
+      border-left: 4px solid #DC2626;
+    }
+    
+    .success {
+      background: #D1FAE5;
+      color: #065F46;
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 15px;
+      border-left: 4px solid #10B981;
+    }
+    
+    .features-toggle {
+      background: #F3F4F6;
+      padding: 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 600;
+      color: #4B5563;
+    }
+    
+    .features-content {
+      display: none;
+      max-height: 200px;
+      overflow-y: auto;
+      font-size: 12px;
+      background: #F9FAFB;
+      padding: 10px;
+      border-radius: 8px;
+      margin-bottom: 15px;
+    }
+    
+    .features-content.show {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Phishing Shield</h1>
+    </div>
+    
+    <div class="content">
+      <div id="loading" class="loading" style="display: none;">
+        <div class="spinner"></div>
+        <p>Analyzing page...</p>
+      </div>
+      
+      <div id="results" style="display: none;">
+        <div id="statusCard" class="status-card">
+          <div class="status-icon" id="statusIcon">✓</div>
+          <div class="status-text" id="statusText">Safe</div>
+          <div class="confidence" id="confidenceText">Confidence: 95%</div>
+        </div>
+        
+        <div class="info-section">
+          <h3>Page Analysis</h3>
+          <div class="info-item">
+            <span class="info-label">URL Length</span>
+            <span class="info-value" id="urlLen">-</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">HTTPS</span>
+            <span class="info-value" id="hasHttps">-</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Forms Detected</span>
+            <span class="info-value" id="numForms">-</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Password Fields</span>
+            <span class="info-value" id="hasPassword">-</span>
+          </div>
+        </div>
+        
+        <div class="features-toggle" id="featuresToggle">
+          <span>View All Features</span>
+          <span id="toggleIcon">▼</span>
+        </div>
+        <div class="features-content" id="featuresContent"></div>
+      </div>
+        
+        <div id="uploadStatus" style="display: none;"></div>
+      </div>
+    </div>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+{
+  "manifest_version": 2,
+  "name": "Phishing Shield",
+  "version": "1.0.0",
+  "description": "AI-powered phishing detection using XGBoost",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["featureextractor.js", "model/predictor.js", "background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    "warning/phishing.html",
+    "model/model.json"
+  ],
+  "applications": {
+    "gecko": {
+      "id": "phishing-shield@example.com",
+      "strict_min_version": "57.0"
+    }
+  }
+}
