@@ -3,8 +3,7 @@ import math
 import logging
 import pathlib
 import re
-import random
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import pandas as pd
 import numpy as np
@@ -47,7 +46,6 @@ class Config:
     base_dir: str = "."
     dataset_dir: str = "dataset"
     mount_drive: bool = False
-    brand_variations_count: int = 10
 
     def __post_init__(self):
         assert self.n_splits >= 2, "n_splits must be at least 2"
@@ -77,163 +75,6 @@ class Config:
         logger.debug(f"Working directory: {self.project_root}")
         logger.debug(f"Dataset directory: {self.dataset_path}")
         logger.debug(f"Output directory: {self.output_dir}")
-
-@staticmethod   
-class BrandVariationGenerator:
-    COMMON_BRANDS = [
-        "paypal", "google", "facebook", "microsoft", "amazon", 
-        "apple", "netflix", "instagram", "twitter", "linkedin",
-        "ebay", "yahoo", "bank", "chase", "wellsfargo",
-        "citibank", "bankofamerica", "americanexpress", "visa", "mastercard"
-    ]
-    
-    CYRILLIC_LOOKALIKES = {
-        'a': ['а', 'ӑ', 'ӓ'],
-        'c': ['с', 'ҫ'],
-        'e': ['е', 'ё', 'ӗ'],
-        'h': ['һ'],
-        'i': ['і', 'ӏ'],
-        'o': ['о', 'ӧ'],
-        'p': ['р'],
-        's': ['ѕ'],
-        'x': ['х'],
-        'y': ['у', 'ӱ'],
-        'b': ['Ь'],
-        'k': ['к'],
-        'm': ['м'],
-        'n': ['п'],
-        't': ['т'],
-    }
-    
-    UNICODE_LOOKALIKES = {
-        'a': ['ɑ', 'α', 'а', 'ａ', 'ạ', 'ả', 'ã', 'â', 'ă'],
-        'b': ['Ь', 'b', 'ḃ', 'ｂ'],
-        'c': ['ϲ', 'с', 'ⅽ', 'ｃ', 'ċ'],
-        'd': ['ԁ', 'ḋ', 'ｄ'],
-        'e': ['е', 'е', 'ė', 'ｅ', 'ẹ', 'ẻ', 'ẽ'],
-        'g': ['ɡ', 'ɢ', 'ġ', 'ｇ'],
-        'h': ['һ', 'ｈ', 'ḣ'],
-        'i': ['і', 'ɪ', 'ı', 'ｉ', 'ị', 'ỉ', 'ĩ'],
-        'j': ['ј', 'ｊ'],
-        'l': ['ӏ', 'Ι', 'l', '|', 'ｌ'],
-        'n': ['п', 'ո', 'ｎ', 'ṅ'],
-        'o': ['о', 'ο', 'σ', 'օ', 'ｏ', 'ọ', 'ỏ', 'õ', 'ô', 'ơ'],
-        'p': ['р', 'р', 'ｐ', 'ṗ'],
-        'q': ['ԛ', 'ｑ'],
-        's': ['ѕ', 'ꜱ', 'ｓ', 'ṡ'],
-        't': ['т', 'ｔ', 'ṫ'],
-        'u': ['υ', 'ս', 'ｕ', 'ụ', 'ủ', 'ũ', 'ư'],
-        'v': ['ν', 'ѵ', 'ｖ'],
-        'w': ['ԝ', 'ｗ', 'ẁ', 'ẃ', 'ẅ'],
-        'x': ['х', 'ⅹ', 'ｘ'],
-        'y': ['у', 'ү', 'ｙ', 'ỳ', 'ý', 'ỵ', 'ỷ', 'ỹ'],
-        'z': ['ᴢ', 'ｚ', 'ż'],
-    }
-    
-    def __init__(self, variations_per_brand: int = 10):
-        self.variations_per_brand = variations_per_brand
-        self.variations = self._generate_all_variations()
-    
-    def _generate_homoglyph_variations(self, brand: str) -> Set[str]:
-        variations = set()
-        
-        for _ in range(self.variations_per_brand):
-            variant = list(brand)
-            num_changes = random.randint(1, min(3, len(brand)))
-            positions = random.sample(range(len(brand)), num_changes)
-            
-            for pos in positions:
-                char = brand[pos]
-                if char in self.UNICODE_LOOKALIKES:
-                    variant[pos] = random.choice(self.UNICODE_LOOKALIKES[char])
-                elif char in self.CYRILLIC_LOOKALIKES:
-                    variant[pos] = random.choice(self.CYRILLIC_LOOKALIKES[char])
-            
-            variations.add(''.join(variant))
-        
-        return variations
-    
-    def _generate_brand_variations(self, brand: str) -> Set[str]:
-        variations = set()
-        
-        char_substitutions = {
-            'o': ['0', 'oo', 'ou'],
-            'i': ['1', 'l', '!'],
-            'e': ['3', 'ee'],
-            'a': ['@', '4', 'aa'],
-            's': ['5', '$', 'ss'],
-            'l': ['1', 'i', '|'],
-            't': ['7', '+'],
-            'g': ['9', 'q'],
-            'b': ['8', '6'],
-        }
-        
-        for _ in range(self.variations_per_brand):
-            variant = list(brand)
-            num_changes = random.randint(1, min(3, len(brand)))
-            positions = random.sample(range(len(brand)), num_changes)
-            
-            for pos in positions:
-                char = brand[pos]
-                if char in char_substitutions:
-                    variant[pos] = random.choice(char_substitutions[char])
-            
-            variations.add(''.join(variant))
-        
-        for i in range(len(brand)):
-            if i < len(brand) - 1:
-                swapped = list(brand)
-                swapped[i], swapped[i+1] = swapped[i+1], swapped[i]
-                variations.add(''.join(swapped))
-        
-        for i in range(len(brand)):
-            doubled = brand[:i] + brand[i] + brand[i:]
-            variations.add(doubled)
-        
-        for i in range(len(brand)):
-            removed = brand[:i] + brand[i+1:]
-            if removed:
-                variations.add(removed)
-        
-        variations.update(self._generate_homoglyph_variations(brand))
-        
-        return variations
-    
-    def _generate_all_variations(self) -> Set[str]:
-        all_variations = set()
-        for brand in self.COMMON_BRANDS:
-            variations = self._generate_brand_variations(brand)
-            all_variations.update(variations)
-        return all_variations
-    
-    def _normalize_unicode(self, text: str) -> str:
-        normalized = []
-        for char in text:
-            found = False
-            for latin_char, lookalikes in self.UNICODE_LOOKALIKES.items():
-                if char in lookalikes or char == latin_char:
-                    normalized.append(latin_char)
-                    found = True
-                    break
-            if not found:
-                for latin_char, lookalikes in self.CYRILLIC_LOOKALIKES.items():
-                    if char in lookalikes:
-                        normalized.append(latin_char)
-                        found = True
-                        break
-            if not found:
-                normalized.append(char)
-        return ''.join(normalized)
-    
-    def has_misspelled_brand(self, url: str) -> bool:
-        url_lower = url.lower()
-        url_normalized = self._normalize_unicode(url_lower)
-        
-        for brand in self.COMMON_BRANDS:
-            if brand in url_normalized and brand not in url_lower:
-                return True
-        
-        return any(variation in url_lower for variation in self.variations)
 
 class DatasetLoader:
     def __init__(self, config: Config):
@@ -382,7 +223,7 @@ class FeatureExtractor:
             return False
 
     @staticmethod
-    def extract_lexical(url: str, brand_generator) -> Dict: 
+    def extract_lexical(url: str) -> Dict:
         try:
             p = urlparse(url)
             host = (p.netloc or "").lower()
@@ -415,7 +256,7 @@ class FeatureExtractor:
                     "subdomain_count": 0,
                     "digit_letter_ratio": (sum(c.isdigit() for c in url) / max(1, sum(c.isalpha() for c in url))),
                     "has_punycode": 0,
-                    "has_misspelled_brand": int(brand_generator.has_misspelled_brand(url)),
+                    "has_misspelled_brand": int(any(bad in url for bad in ["paypai","g00gle","faceb00k","micros0ft"])),
                     "keyword_pressure": int(any(kw in url.lower() for kw in ["urgent","alert","warning","unlock"])),
                     "rare_tld": 0,
                     "path_depth": urlparse(url).path.count("/"),
@@ -440,7 +281,7 @@ class FeatureExtractor:
                 "subdomain_count": host.count(".") - 1 if "." in host else 0,
                 "digit_letter_ratio": (sum(c.isdigit() for c in url) / max(1, sum(c.isalpha() for c in url))),
                 "has_punycode": int("xn--" in url),
-                "has_misspelled_brand": int(brand_generator.has_misspelled_brand(url)),
+                "has_misspelled_brand": int(any(bad in url for bad in ["paypai", "g00gle", "faceb00k", "micros0ft"])),
                 "keyword_pressure": int(any(kw in url.lower() for kw in ["urgent", "alert", "warning", "unlock"])),
                 "rare_tld": int(any(url.endswith(t) for t in [".zip", ".kim", ".country", ".science", ".work"])),
                 "path_depth": urlparse(url).path.count("/"),
@@ -500,10 +341,7 @@ class PhishingDetector:
         self.scaler = StandardScaler() if config.enable_feature_scaling else None
         self.label_encoder = LabelEncoder()
         configure_logging(config.debug_mode)
-        
-        self.brand_generator = BrandVariationGenerator(
-            variations_per_brand=config.brand_variations_count
-        )
+
     def process_samples(self, samples: List[Dict]) -> List[Dict]:
         rows = []
         failed_count = 0
@@ -705,8 +543,7 @@ if __name__ == "__main__":
         debug_mode=True,
         run_local=True,
         base_dir=".",
-        dataset_dir="dataset",
-        brand_variations_count = 10
+        dataset_dir="dataset"
     )
     
     detector = PhishingDetector(config)
